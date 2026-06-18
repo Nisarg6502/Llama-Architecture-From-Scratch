@@ -4,7 +4,7 @@ A 150-million parameter autoregressive language model built entirely from scratc
 
 Rather than relying on the standard 2019 GPT-2 architecture, this model's internals were modernized to mimic Meta's **Llama 3** architecture, significantly improving training throughput, context understanding, and stability.
 
-🔗 [**Click here to chat with the model live on HuggingFace!**](#) *(Add your HuggingFace Space link here later)*
+🔗 [**Click here to chat with the model live on HuggingFace!**](https://huggingface.co/spaces/nisarg6502/Custom-Llama-150M-Model)
 
 ## 🏗️ Architecture & Upgrades
 
