@@ -6,6 +6,7 @@ import math
 import tiktoken
 from dataclasses import dataclass
 from huggingface_hub import hf_hub_download
+from safetensors.torch import load_file
 
 # ==========================================
 # 1. ARCHITECTURE (Required to load pii_model.pt)
@@ -167,27 +168,26 @@ tokenizer = SimpleTokenizer()
 
 try:
     print("Downloading weights from Hugging Face Hub...")
-    # Replace 'your-username/pii-redactor-150m' with your actual HF repo ID
-    # Replace the filename with your exact uploaded .pt file
     model_path = hf_hub_download(
         repo_id="nisarg6502/Llama3-150M-PII-Redactor", 
-        filename="pii_model_epoch_3.pt"
+        filename="pii_model_epoch_3.safetensors" 
     )
     
-    print("Loading weights into memory...")
-    checkpoint = torch.load(model_path, map_location=device, weights_only=False)
-    model = GPT(checkpoint['config'])
-    model.load_state_dict(checkpoint['model_state_dict'])
+    # Instantiate the architecture
+    config = GPTConfig()
+    model = GPT(config)
+    
+    print("Loading safetensors into memory...")
+    state_dict = load_file(model_path, device=str(device))
+    model.load_state_dict(state_dict)
     model.to(device)
     model.eval()
     
     model_loaded = True
     print("Model loaded successfully!")
-    
 except Exception as e:
     model_loaded = False
-    error_msg = str(e)
-    print(f"Failed to load model: {error_msg}")
+    print(f"Failed to load model: {str(e)}")
 
 # ... (The rest of your scrub_text function and Gradio UI code stays exactly the same!) ...
 
