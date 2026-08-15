@@ -44,9 +44,13 @@ class RotaryPositionalEmbedding(nn.Module):
         x2 = x[..., x.shape[-1] // 2 :]
         return torch.cat([-x2, x1], dim=-1)
 
-    def forward(self, x, seq_len):
-        cos = self.cos_cached[:seq_len].unsqueeze(0).unsqueeze(0)
-        sin = self.sin_cached[:seq_len].unsqueeze(0).unsqueeze(0)
+    def forward(self, x, offset=0):
+        # offset = absolute position of x[..., 0, :] in the full sequence.
+        # Needed for KV caching: a newly generated token at position `offset`
+        # must be rotated with that position's angle, not position 0.
+        seq_len = x.shape[-2]
+        cos = self.cos_cached[offset:offset + seq_len].unsqueeze(0).unsqueeze(0)
+        sin = self.sin_cached[offset:offset + seq_len].unsqueeze(0).unsqueeze(0)
         return (x * cos) + (self.rotate_half(x) * sin)
 
 def create_causal_mask(seq_len, device):
@@ -65,14 +69,23 @@ class MultiHeadAttention(nn.Module):
         self.attn_dropout = nn.Dropout(dropout)
         self.resid_dropout = nn.Dropout(dropout)
 
-    def forward(self, x, mask=None):
+    def forward(self, x, mask=None, past_kv=None, use_cache=False):
         batch_size, seq_len, _ = x.shape
         qkv = self.qkv_proj(x)
         qkv = qkv.reshape(batch_size, seq_len, 3, self.num_heads, self.head_dim)
         qkv = qkv.permute(2, 0, 3, 1, 4)
         q, k, v = qkv[0], qkv[1], qkv[2]
-        q = self.rotary(q, seq_len)
-        k = self.rotary(k, seq_len)
+
+        offset = past_kv[0].shape[-2] if past_kv is not None else 0
+        q = self.rotary(q, offset=offset)
+        k = self.rotary(k, offset=offset)
+
+        if past_kv is not None:
+            past_k, past_v = past_kv
+            k = torch.cat([past_k, k], dim=-2)
+            v = torch.cat([past_v, v], dim=-2)
+        new_kv = (k, v) if use_cache else None
+
         attn_scores = (q @ k.transpose(-2, -1)) / math.sqrt(self.head_dim)
         if mask is not None:
             attn_scores = attn_scores.masked_fill(mask == 0, float('-inf'))
@@ -82,7 +95,7 @@ class MultiHeadAttention(nn.Module):
         attn_output = attn_output.transpose(1, 2).contiguous()
         attn_output = attn_output.reshape(batch_size, seq_len, self.d_model)
         output = self.out_proj(attn_output)
-        return self.resid_dropout(output)
+        return self.resid_dropout(output), new_kv
 
 class RMSNorm(nn.Module):
     def __init__(self, d_model, eps=1e-6):
@@ -113,10 +126,11 @@ class TransformerBlock(nn.Module):
         self.norm2 = RMSNorm(d_model)
         self.ffn = SwiGLU(d_model)
 
-    def forward(self, x, mask=None):
-        x = x + self.attention(self.norm1(x), mask)
+    def forward(self, x, mask=None, past_kv=None, use_cache=False):
+        attn_out, new_kv = self.attention(self.norm1(x), mask, past_kv, use_cache)
+        x = x + attn_out
         x = x + self.ffn(self.norm2(x))
-        return x
+        return x, new_kv
 
 @dataclass
 class GPTConfig:
@@ -150,32 +164,62 @@ class GPT(nn.Module):
         self.lm_head = nn.Linear(config.d_model, config.vocab_size, bias=False)
         self.token_embedding.weight = self.lm_head.weight
 
-    def forward(self, input_ids, targets=None):
+    def forward(self, input_ids, targets=None, past_kv_list=None, use_cache=False):
         batch_size, seq_len = input_ids.shape
         x = self.token_embedding(input_ids)
         x = self.embd_dropout(x)
-        mask = create_causal_mask(seq_len, input_ids.device)
-        for layer in self.layers:
-            x = layer(x, mask)
+
+        if past_kv_list is None:
+            mask = create_causal_mask(seq_len, input_ids.device)
+            past_kv_list = [None] * len(self.layers)
+        else:
+            # decode step: single new token attending to cache + itself,
+            # every cached position is a valid attend target -> no mask needed
+            mask = None
+
+        new_past_kv_list = []
+        for layer, past_kv in zip(self.layers, past_kv_list):
+            x, new_kv = layer(x, mask, past_kv, use_cache)
+            new_past_kv_list.append(new_kv)
+
         x = self.final_norm(x)
         logits = self.lm_head(x)
+        if use_cache:
+            return logits, new_past_kv_list
         return logits, None
 
     @torch.no_grad()
     def generate(self, input_ids, max_new_tokens, temperature=1.0, top_k=None, top_p=None):
+        # KV-cached generation: the prompt is processed once (prefill), then
+        # each new token only attends against its own Q against the cached
+        # K/V instead of recomputing attention over the whole sequence.
         self.eval()
-        for _ in range(max_new_tokens):
-            if input_ids.shape[1] > self.config.max_seq_len:
-                input_ids = input_ids[:, -self.config.max_seq_len:]
-            logits, _ = self.forward(input_ids)
+        if input_ids.shape[1] > self.config.max_seq_len:
+            input_ids = input_ids[:, -self.config.max_seq_len:]
+
+        def sample(logits):
             logits = logits[:, -1, :] / temperature
             if top_k is not None:
                 v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
                 logits[logits < v[:, -1:]] = float('-inf')
             probs = F.softmax(logits, dim=-1)
-            next_token = torch.multinomial(probs, num_samples=1)
-            input_ids = torch.cat([input_ids, next_token], dim=1)
-        return input_ids
+            return torch.multinomial(probs, num_samples=1)
+
+        logits, past_kv = self.forward(input_ids, use_cache=True)
+        next_token = sample(logits)
+        all_ids = torch.cat([input_ids, next_token], dim=1)
+
+        cur_len = input_ids.shape[1]
+        for _ in range(max_new_tokens - 1):
+            if cur_len >= self.config.max_seq_len:
+                break  # no cache-eviction / sliding window implemented; stop cleanly
+
+            logits, past_kv = self.forward(next_token, past_kv_list=past_kv, use_cache=True)
+            next_token = sample(logits)
+            all_ids = torch.cat([all_ids, next_token], dim=1)
+            cur_len += 1
+
+        return all_ids
 
 # ====================================================================
 # 2. RUNNING THE MODEL INTERACTIVELY

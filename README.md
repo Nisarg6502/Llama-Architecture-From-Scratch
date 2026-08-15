@@ -33,6 +33,24 @@ Instead of traditional next-token prediction, the training loop utilizes **Loss 
 * **Memory Footprint:** ~600MB (Calculated footprint for 150M parameters in 32-bit float).
 * **Hardware Requirement:** Designed specifically for fast, headless inference on standard consumer CPU infrastructure without requiring dedicated GPU accelerators.
 
+## ⚡ Stage 4: Inference Optimization (KV Caching)
+
+The original `generate()` loop recomputed attention over the *entire* growing sequence on every decoded token — O(n²) cost for an O(n) generation task. This was benchmarked, root-caused, and fixed with a proper key/value cache.
+
+* **Root cause:** no KV cache — every new token triggered a full forward pass over all previously generated tokens instead of reusing their already-computed keys/values.
+* **Fix:** each attention layer now caches past K/V and only computes Q/K/V for the newly generated token, concatenating it onto the cache. RoPE was updated to rotate by absolute sequence position (`offset`) rather than always starting at 0, which is required for cached decoding to stay numerically correct.
+* **Correctness:** verified token-for-token identical output between the cached and non-cached generation paths (same seed, same weights, no retraining involved — KV caching is a pure inference-time optimization, not an architecture change).
+
+**Benchmark (12-core CPU, batch size 1, 100 generated tokens, mean of 15 runs):**
+
+| Prompt length | Before (no cache) | After (KV cache) | Speedup |
+|---|---|---|---|
+| Short (19 tokens in) | 246 ms/token (4.1 tok/s) | 48.6 ms/token (20.6 tok/s) | **5.06x** |
+| Medium (45 tokens in) | 277 ms/token (3.6 tok/s) | 49.3 ms/token (20.3 tok/s) | **5.62x** |
+| Long (115 tokens in) | 353 ms/token (2.8 tok/s) | 51.0 ms/token (19.6 tok/s) | **6.93x** |
+
+**Average speedup: 5.87x.** Note that per-token latency for the cached path stays roughly flat (~49–51 ms) regardless of prompt length, while the uncached path's latency grows with context length — direct confirmation that the fix eliminates the redundant recomputation.
+
 ---
 
 ## 💻 How to Run Locally
