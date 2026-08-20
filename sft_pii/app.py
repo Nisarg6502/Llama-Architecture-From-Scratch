@@ -59,6 +59,25 @@ class RotaryPositionalEmbedding(nn.Module):
 def create_causal_mask(seq_len, device):
     return torch.tril(torch.ones(seq_len, seq_len, device=device)).view(1, 1, seq_len, seq_len)
 
+def _is_stuck_in_loop(generated, run_length=3, period_max=16):
+    # Detects the model repeating the same token, or the same short n-gram,
+    # `run_length` times in a row. An earlier attempt banned repeated tokens
+    # outright (the standard no-repeat-ngram technique); on this small,
+    # lightly-trained model that forced picks from a poorly calibrated tail
+    # distribution and produced gibberish/hallucinated tags instead of clean
+    # text. Detecting the loop and stopping (like hitting EOS) avoids ever
+    # forcing a bad choice -- it just ends the response where it degenerates.
+    n = len(generated)
+    for period in range(1, period_max + 1):
+        needed = period * run_length
+        if n < needed:
+            continue
+        window = generated[-needed:]
+        pattern = window[:period]
+        if all(window[i:i + period] == pattern for i in range(0, needed, period)):
+            return True
+    return False
+
 class MultiHeadAttention(nn.Module):
     def __init__(self, d_model, num_heads, dropout=0.1):
         super().__init__()
@@ -171,29 +190,39 @@ class GPT(nn.Module):
         return logits
 
     @torch.no_grad()
-    def generate(self, input_ids, max_new_tokens, temperature=0.2, stop_token_id=None):
+    def generate(self, input_ids, max_new_tokens, temperature=0.2, stop_token_id=None, stop_on_loop=True):
         # KV-cached generation: the prompt is processed once (prefill), then
         # each new token only attends against its own Q against the cached
         # K/V instead of recomputing attention over the whole sequence.
+        #
+        # stop_on_loop: stops generation if the model degenerates into
+        # repeating the same token/short n-gram (a real, observed failure
+        # mode on this small model -- see _is_stuck_in_loop above).
         self.eval()
         if input_ids.shape[1] > self.config.max_seq_len:
             input_ids = input_ids[:, -self.config.max_seq_len:]
+
+        history = input_ids[0].tolist()
 
         logits, past_kv = self.forward(input_ids, use_cache=True)
         logits = logits[:, -1, :] / temperature
         probs = F.softmax(logits, dim=-1)
         next_token = torch.multinomial(probs, num_samples=1)
+        history.append(next_token.item())
         all_ids = torch.cat([input_ids, next_token], dim=1)
 
         cur_len = input_ids.shape[1]
         for _ in range(max_new_tokens - 1):
             if cur_len >= self.config.max_seq_len:
                 break  # no cache-eviction / sliding window implemented; stop cleanly
+            if stop_on_loop and _is_stuck_in_loop(history):
+                break
 
             logits, past_kv = self.forward(next_token, past_kv_list=past_kv, use_cache=True)
             logits = logits[:, -1, :] / temperature
             probs = F.softmax(logits, dim=-1)
             next_token = torch.multinomial(probs, num_samples=1)
+            history.append(next_token.item())
 
             all_ids = torch.cat([all_ids, next_token], dim=1)
             cur_len += 1
