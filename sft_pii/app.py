@@ -213,8 +213,8 @@ tokenizer = SimpleTokenizer()
 try:
     print("Downloading weights from Hugging Face Hub...")
     model_path = hf_hub_download(
-        repo_id="nisarg6502/Llama3-150M-PII-Redactor", 
-        filename="pii_model_epoch_3.safetensors" 
+        repo_id="nisarg6502/Llama3-150M-PII-Redactor",
+        filename="pii_model_epoch_1.safetensors"
     )
     
     # Instantiate the architecture
